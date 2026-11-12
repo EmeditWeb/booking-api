@@ -36,6 +36,8 @@ type Booking struct {
 var (
 	errNotFound    = errors.New("not found")
 	errSlotStarted = errors.New("slot has already started")
+	errSlotTaken   = errors.New("slot already booked")
+	errCancelled   = errors.New("booking already cancelled")
 )
 
 const bookingCols = "id, slot_id, name, email, status, created_at"
@@ -50,15 +52,15 @@ func scanBooking(row pgx.Row) (Booking, error) {
 	return b, err
 }
 
-func pgCode(err error) string {
+func pgError(err error) *pgconn.PgError {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return pgErr.Code
+		return pgErr
 	}
-	return ""
+	return &pgconn.PgError{}
 }
 
-func isUniqueViolation(err error) bool { return pgCode(err) == "23505" }
+func isUniqueViolation(err error) bool { return pgError(err).Code == "23505" }
 
 func newID() string {
 	b := make([]byte, 8)
@@ -119,10 +121,31 @@ func (s *server) createBooking(ctx context.Context, slotID, name, email string) 
 		INSERT INTO bookings (id, slot_id, name, email, status)
 		VALUES ($1, $2, $3, $4, 'confirmed')
 		RETURNING `+bookingCols, newID(), slotID, name, email))
-	if pgCode(err) == "23503" { // slot removed by a concurrent /reset between the lookup and the insert
+	switch pgErr := pgError(err); {
+	case pgErr.ConstraintName == "one_confirmed_per_slot":
+		// The partial unique index is the double-booking guard: of any number of
+		// simultaneous inserts for one slot, Postgres lets exactly one through.
+		return b, errSlotTaken
+	case pgErr.Code == "23503": // slot removed by a concurrent /reset between the lookup and the insert
 		return b, errNotFound
 	}
 	return b, err
+}
+
+// cancelBooking marks a confirmed booking cancelled, which frees its slot.
+// It returns errNotFound for an unknown id and errCancelled if it was already cancelled.
+func (s *server) cancelBooking(ctx context.Context, id string) (Booking, error) {
+	b, err := scanBooking(s.db.QueryRow(ctx, `
+		UPDATE bookings SET status = 'cancelled'
+		WHERE id = $1 AND status = 'confirmed'
+		RETURNING `+bookingCols, id))
+	if !errors.Is(err, errNotFound) {
+		return b, err
+	}
+	if _, err := s.getBooking(ctx, id); err != nil {
+		return b, err
+	}
+	return b, errCancelled
 }
 
 func (s *server) getBooking(ctx context.Context, id string) (Booking, error) {

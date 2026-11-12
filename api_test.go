@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -257,5 +258,99 @@ func TestLevel2Validation(t *testing.T) {
 	}
 	if _, got := call(t, ts, "GET", "/bookings/"+b["id"].(string), ""); got["email"] != "ada.obi@example.com" {
 		t.Errorf("stored email not normalised: %v", got)
+	}
+}
+
+func TestLevel3NoDoubleBooking(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+
+	const n = 50
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all requests at the same moment
+			code, _ := call(t, ts, "POST", "/bookings", fmt.Sprintf(`{"slot_id":"s1","name":"P%d","email":"p%d@example.com"}`, i, i))
+			codes <- code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(codes)
+
+	count := map[int]int{}
+	for c := range codes {
+		count[c]++
+	}
+	if count[201] != 1 || count[409] != n-1 {
+		t.Fatalf("want exactly one 201 and %d 409s, got %v", n-1, count)
+	}
+	if code, body := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Late","email":"late@example.com"}`); code != 409 || body["error"] == nil {
+		t.Errorf("booking a taken slot: %d %v", code, body)
+	}
+}
+
+func TestLevel3Cancel(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+
+	_, b := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`)
+	id := b["id"].(string)
+
+	code, got := call(t, ts, "DELETE", "/bookings/"+id, "")
+	if code != 200 || got["status"] != "cancelled" || got["id"] != id || got["created_at"] != b["created_at"] {
+		t.Fatalf("cancel: %d %v", code, got)
+	}
+	if _, got := call(t, ts, "GET", "/bookings/"+id, ""); got["status"] != "cancelled" {
+		t.Errorf("cancel not persisted: %v", got)
+	}
+	if _, body := call(t, ts, "GET", "/slots", ""); !strings.Contains(strings.Join(slotIDs(body), ","), "s1:free") {
+		t.Errorf("slot not freed: %v", slotIDs(body))
+	}
+	if code, body := call(t, ts, "DELETE", "/bookings/"+id, ""); code != 409 || body["error"] == nil {
+		t.Errorf("second cancel: %d %v", code, body)
+	}
+	if code, body := call(t, ts, "DELETE", "/bookings/bk_missing", ""); code != 404 || body["error"] == nil {
+		t.Errorf("cancel unknown: %d %v", code, body)
+	}
+
+	// the freed slot can be booked again, and the old booking stays cancelled
+	code, again := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Bo","email":"bo@example.com"}`)
+	if code != 201 || again["id"] == id {
+		t.Fatalf("rebook freed slot: %d %v", code, again)
+	}
+	if _, got := call(t, ts, "GET", "/bookings/"+id, ""); got["status"] != "cancelled" {
+		t.Errorf("old booking changed: %v", got)
+	}
+}
+
+func TestLevel3ConcurrentCancel(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	_, b := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`)
+
+	const n = 20
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			code, _ := call(t, ts, "DELETE", "/bookings/"+b["id"].(string), "")
+			codes <- code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	count := map[int]int{}
+	for c := range codes {
+		count[c]++
+	}
+	if count[200] != 1 || count[409] != n-1 {
+		t.Fatalf("want one 200 and %d 409s, got %v", n-1, count)
 	}
 }

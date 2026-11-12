@@ -88,10 +88,26 @@ func (s *server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "slot not found")
 	case errors.Is(err, errSlotStarted):
 		writeError(w, http.StatusBadRequest, "slot has already started")
+	case errors.Is(err, errSlotTaken):
+		writeError(w, http.StatusConflict, "slot already booked")
 	case err != nil:
 		serverError(w, r, err)
 	default:
 		writeJSON(w, http.StatusCreated, b)
+	}
+}
+
+func (s *server) handleCancelBooking(w http.ResponseWriter, r *http.Request) {
+	b, err := s.cancelBooking(r.Context(), r.PathValue("id"))
+	switch {
+	case errors.Is(err, errNotFound):
+		writeError(w, http.StatusNotFound, "booking not found")
+	case errors.Is(err, errCancelled):
+		writeError(w, http.StatusConflict, "booking already cancelled")
+	case err != nil:
+		serverError(w, r, err)
+	default:
+		writeJSON(w, http.StatusOK, b)
 	}
 }
 
