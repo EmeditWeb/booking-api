@@ -6,9 +6,9 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 
 | | |
 |---|---|
-| **Live API** | _added at deploy_ |
-| **Web page** | _added at deploy_ (`/`) |
-| **Swagger docs** | _added at deploy_ (`/docs`) |
+| **Live API** | https://booking-api-xrbi.onrender.com |
+| **Web page** | https://booking-api-xrbi.onrender.com/ |
+| **Swagger docs** | https://booking-api-xrbi.onrender.com/docs (click **Authorize**, enter the API key, then **Try it out**) |
 | **Stack** | Go 1.22 (`net/http`), PostgreSQL (Neon), `pgx/v5`, Docker, Render |
 
 ---
@@ -24,7 +24,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 | 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ✅ |
 | 5 | Rate limit: 5 booking attempts per email per minute, plus a per-IP flood guard on every route | ✅ |
 | — | Web page | ✅ |
-| — | Deployed over HTTPS | ⏳ |
+| — | Deployed over HTTPS (Render + Neon, Frankfurt) | ✅ |
 
 ---
 
@@ -46,7 +46,7 @@ Public, no key needed: `/` (the web page), `/docs` (Swagger UI), `/openapi.json`
 ### Example
 
 ```bash
-API=https://<your-deployment>
+API=https://booking-api-xrbi.onrender.com
 KEY=<your api key>
 
 # Load slots
@@ -119,6 +119,7 @@ The API key is entered once and kept in `sessionStorage` for that tab only; it i
 2. In Render: **New → Blueprint**, pick this repo. `render.yaml` defines a free Docker web service in Frankfurt.
 3. Enter `DATABASE_URL` (the Neon string, with `sslmode=require`) and `API_KEY` when Render asks.
 4. The schema is created on first boot. `/openapi.json` is the health check.
+5. `.github/workflows/keepalive.yml` pings the service every 10 minutes so the free instance doesn't sleep.
 
 ---
 
