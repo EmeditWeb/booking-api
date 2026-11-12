@@ -19,6 +19,9 @@ var schemaSQL string
 //go:embed docs/openapi.json
 var openapiJSON []byte
 
+//go:embed web/index.html
+var indexHTML []byte
+
 type server struct {
 	db         *pgxpool.Pool
 	apiKey     string
@@ -82,6 +85,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /bookings", s.handleListBookings)
 	mux.HandleFunc("GET /bookings/{id}", s.handleGetBooking)
 	mux.HandleFunc("DELETE /bookings/{id}", s.handleCancelBooking)
+	mux.HandleFunc("GET /{$}", servePage)
 	mux.HandleFunc("GET /docs", serveDocs)
 	mux.HandleFunc("GET /openapi.json", serveSpec)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

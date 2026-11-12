@@ -1,0 +1,14 @@
+# Render Blueprint: New → Blueprint → pick this repo. Render asks for the two secrets below.
+services:
+  - type: web
+    name: booking-api
+    runtime: docker
+    plan: free
+    region: frankfurt          # same region as the Neon database (aws-eu-central-1)
+    healthCheckPath: /openapi.json
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false            # Neon connection string, entered in the dashboard
+      - key: API_KEY
+        sync: false            # the key clients send in X-API-Key

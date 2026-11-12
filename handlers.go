@@ -265,6 +265,11 @@ SwaggerUIBundle({url: "/openapi.json", dom_id: "#ui", docExpansion: "list",
 </body>
 </html>`
 
+func servePage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(indexHTML)
+}
+
 func serveDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(docsHTML))

@@ -203,7 +203,7 @@ func TestLevel2APIKey(t *testing.T) {
 			}
 		}
 	}
-	for _, path := range []string{"/docs", "/openapi.json"} {
+	for _, path := range []string{"/", "/docs", "/openapi.json"} {
 		res, err := http.Get(ts.URL + path)
 		if err != nil || res.StatusCode != 200 {
 			t.Errorf("%s must be public: %v %v", path, err, res)
