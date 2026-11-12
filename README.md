@@ -23,7 +23,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 | 3 | No double booking, even for simultaneous requests; cancellation | ✅ |
 | 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ✅ |
 | 5 | Rate limit: 5 booking attempts per email per minute, plus a per-IP flood guard on every route | ✅ |
-| — | Web page | ⏳ |
+| — | Web page | ✅ |
 | — | Deployed over HTTPS | ⏳ |
 
 ---
@@ -99,6 +99,29 @@ IP flood guard → API key → idempotency replay → per-email rate limit → r
 
 ---
 
+## Web page
+
+`/` serves a single-file page (`web/index.html`, embedded in the binary, no build step or dependencies):
+
+- **Slots**: grouped by day, shown in the visitor's own time zone, filterable by provider. Booked and past slots are disabled.
+- **Book**: name and email in a dialog. Every attempt gets an `Idempotency-Key`, so a double-click or flaky network can't book twice. Editing the form makes a new key.
+- **Confirmation**: booking id, provider, time, name, email, status, with a one-click cancel.
+- **My bookings**: look up by email, page with "Load more" (cursor pagination), cancel any confirmed booking.
+- **Errors**: shown with the API's own message; 429 shows the `Retry-After` countdown.
+
+The API key is entered once and kept in `sessionStorage` for that tab only; it is never in the page source. All API data is rendered with `textContent`, never `innerHTML`, so a booking named `<script>` is just text.
+
+---
+
+## Deploying (Render + Neon)
+
+1. Create a Neon project (Frankfurt, matching the server region) and copy its connection string.
+2. In Render: **New → Blueprint**, pick this repo. `render.yaml` defines a free Docker web service in Frankfurt.
+3. Enter `DATABASE_URL` (the Neon string, with `sslmode=require`) and `API_KEY` when Render asks.
+4. The schema is created on first boot. `/openapi.json` is the health check.
+
+---
+
 ## Running locally
 
 Prerequisites: Go 1.22+, Docker.
@@ -146,6 +169,7 @@ store.go         all SQL
 ratelimit.go     sliding-window limiter, per-IP middleware
 schema.sql       tables and indexes (embedded, idempotent)
 web/index.html   the booking page (embedded)
+render.yaml      Render Blueprint (free Docker service, Frankfurt)
 docs/            official OpenAPI spec and implementation plan
 api_test.go      end-to-end tests against Postgres
 ratelimit_test.go limiter unit tests with a fake clock
