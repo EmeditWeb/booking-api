@@ -20,7 +20,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 | 0 | Scaffold: config, database, schema, Swagger docs, Dockerfile | ✅ |
 | 1 | List slots, book one, look up a booking | ✅ |
 | 2 | API key on every request; reject missing or invalid booking details | ✅ |
-| 3 | No double booking, even for simultaneous requests; cancellation | ⏳ |
+| 3 | No double booking, even for simultaneous requests; cancellation | ✅ |
 | 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ⏳ |
 | 5 | Rate limit: 5 booking attempts per email per minute | ⏳ |
 | — | Web page | ⏳ |

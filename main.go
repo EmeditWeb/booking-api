@@ -69,6 +69,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /slots", s.handleListSlots)
 	mux.HandleFunc("POST /bookings", s.handleCreateBooking)
 	mux.HandleFunc("GET /bookings/{id}", s.handleGetBooking)
+	mux.HandleFunc("DELETE /bookings/{id}", s.handleCancelBooking)
 	mux.HandleFunc("GET /docs", serveDocs)
 	mux.HandleFunc("GET /openapi.json", serveSpec)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
