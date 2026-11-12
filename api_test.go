@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testKey = "test-key"
@@ -71,4 +72,103 @@ func TestScaffold(t *testing.T) {
 		t.Fatalf("docs: %v %v", err, res)
 	}
 	res.Body.Close()
+}
+
+// seed resets the API to three future slots and returns their start times by id.
+func seed(t *testing.T, ts *httptest.Server) map[string]string {
+	t.Helper()
+	at := func(h int) string {
+		return time.Now().UTC().Add(time.Duration(h) * time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	}
+	starts := map[string]string{"s1": at(48), "s2": at(24), "s3": at(72)}
+	body := `{"slots":[
+		{"id":"s1","provider":"Dr Ade","start":"` + starts["s1"] + `","end":"` + at(49) + `"},
+		{"id":"s2","provider":"Dr Bisi","start":"` + starts["s2"] + `","end":"` + at(25) + `"},
+		{"id":"s3","provider":"Dr Ade","start":"` + starts["s3"] + `","end":"` + at(73) + `"}]}`
+	if code, out := call(t, ts, "POST", "/reset", body); code != 200 {
+		t.Fatalf("reset: %d %v", code, out)
+	}
+	return starts
+}
+
+// slotIDs returns the ids of a /slots response in order, with availability as a suffix ("s1:true").
+func slotIDs(body map[string]any) []string {
+	var ids []string
+	for _, v := range body["slots"].([]any) {
+		m := v.(map[string]any)
+		ids = append(ids, m["id"].(string)+":"+map[bool]string{true: "free", false: "taken"}[m["available"].(bool)])
+	}
+	return ids
+}
+
+func TestLevel1(t *testing.T) {
+	ts := newTestServer(t)
+	starts := seed(t, ts)
+
+	_, body := call(t, ts, "GET", "/slots", "")
+	if got := strings.Join(slotIDs(body), ","); got != "s2:free,s1:free,s3:free" {
+		t.Errorf("slots not sorted by start: %s", got)
+	}
+	first := body["slots"].([]any)[1].(map[string]any)
+	if first["provider"] != "Dr Ade" || first["start"] != starts["s1"] {
+		t.Errorf("slot fields: %v", first)
+	}
+
+	_, body = call(t, ts, "GET", "/slots?provider=Dr%20Ade", "")
+	if got := strings.Join(slotIDs(body), ","); got != "s1:free,s3:free" {
+		t.Errorf("provider filter: %s", got)
+	}
+	_, body = call(t, ts, "GET", "/slots?provider=Dr", "")
+	if got := len(body["slots"].([]any)); got != 0 {
+		t.Errorf("provider filter must be exact, got %d slots", got)
+	}
+
+	code, booking := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Ada Obi","email":"ada@example.com"}`)
+	if code != 201 || booking["status"] != "confirmed" || booking["slot_id"] != "s1" || booking["id"] == "" || booking["created_at"] == nil {
+		t.Fatalf("create booking: %d %v", code, booking)
+	}
+
+	_, body = call(t, ts, "GET", "/slots", "")
+	if got := strings.Join(slotIDs(body), ","); got != "s2:free,s1:taken,s3:free" {
+		t.Errorf("availability after booking: %s", got)
+	}
+
+	code, got := call(t, ts, "GET", "/bookings/"+booking["id"].(string), "")
+	if code != 200 || got["id"] != booking["id"] || got["email"] != "ada@example.com" {
+		t.Errorf("get booking: %d %v", code, got)
+	}
+	if code, body := call(t, ts, "GET", "/bookings/bk_missing", ""); code != 404 || body["error"] == nil {
+		t.Errorf("missing booking: %d %v", code, body)
+	}
+
+	// reset wipes bookings and replaces slots
+	seed(t, ts)
+	if code, _ := call(t, ts, "GET", "/bookings/"+booking["id"].(string), ""); code != 404 {
+		t.Errorf("booking survived reset: %d", code)
+	}
+}
+
+func TestResetValidation(t *testing.T) {
+	ts := newTestServer(t)
+	for name, body := range map[string]string{
+		"not json":      `nope`,
+		"no slots key":  `{}`,
+		"missing field": `{"slots":[{"id":"s1","provider":"Dr Ade","start":"2026-12-10T09:00:00Z"}]}`,
+		"bad time":      `{"slots":[{"id":"s1","provider":"Dr Ade","start":"tomorrow","end":"2026-12-10T09:30:00Z"}]}`,
+		"duplicate id":  `{"slots":[{"id":"s1","provider":"A","start":"2026-12-10T09:00:00Z","end":"2026-12-10T09:30:00Z"},{"id":"s1","provider":"B","start":"2026-12-10T10:00:00Z","end":"2026-12-10T10:30:00Z"}]}`,
+	} {
+		if code, out := call(t, ts, "POST", "/reset", body); code != 400 || out["error"] == nil {
+			t.Errorf("%s: got %d %v", name, code, out)
+		}
+	}
+	// past slots are allowed, and an empty list is valid
+	if code, _ := call(t, ts, "POST", "/reset", `{"slots":[{"id":"old","provider":"A","start":"2020-01-01T09:00:00Z","end":"2020-01-01T09:30:00Z"}]}`); code != 200 {
+		t.Errorf("past slot rejected: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/reset", `{"slots":[]}`); code != 200 {
+		t.Errorf("empty slot list rejected: %d", code)
+	}
+	if _, body := call(t, ts, "GET", "/slots", ""); body["slots"] == nil {
+		t.Errorf("empty slot list must be [], got %v", body)
+	}
 }
