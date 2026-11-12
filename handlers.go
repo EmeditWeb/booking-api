@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
 )
 
@@ -61,40 +66,123 @@ func (s *server) handleListSlots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"slots": slots})
 }
 
+type bookingRequest struct {
+	SlotID string `json:"slot_id"`
+	Name   string `json:"name"`
+	Email  string `json:"email"`
+}
+
+// hash identifies a request body by its field values, so formatting and key order don't matter.
+func (in bookingRequest) hash() string {
+	sum := sha256.Sum256([]byte(in.SlotID + "\x00" + in.Name + "\x00" + in.Email))
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		SlotID string `json:"slot_id"`
-		Name   string `json:"name"`
-		Email  string `json:"email"`
-	}
+	var in bookingRequest
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "body must be JSON with string fields slot_id, name and email")
 		return
 	}
-	slotID, name := strings.TrimSpace(in.SlotID), strings.TrimSpace(in.Name)
-	email := strings.ToLower(strings.TrimSpace(in.Email))
-	if slotID == "" || name == "" || email == "" {
-		writeError(w, http.StatusBadRequest, "slot_id, name and email are required")
-		return
-	}
-	if !validEmail(email) {
-		writeError(w, http.StatusBadRequest, "email is not valid")
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > 255 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key must be at most 255 characters")
 		return
 	}
 
-	b, err := s.createBooking(r.Context(), slotID, name, email)
+	var status int
+	var body []byte
+	var err error
+	if key == "" {
+		status, body, err = s.book(r.Context(), s.db, in)
+	} else {
+		status, body, err = s.once(r.Context(), key, in.hash(), func(q querier) (int, []byte, error) {
+			return s.book(r.Context(), q, in)
+		})
+	}
 	switch {
-	case errors.Is(err, errNotFound):
-		writeError(w, http.StatusNotFound, "slot not found")
-	case errors.Is(err, errSlotStarted):
-		writeError(w, http.StatusBadRequest, "slot has already started")
-	case errors.Is(err, errSlotTaken):
-		writeError(w, http.StatusConflict, "slot already booked")
+	case errors.Is(err, errKeyReused):
+		writeError(w, http.StatusUnprocessableEntity, "Idempotency-Key was already used with a different body")
 	case err != nil:
 		serverError(w, r, err)
 	default:
-		writeJSON(w, http.StatusCreated, b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(body)
 	}
+}
+
+// book validates and creates a booking, returning the status and JSON body to send.
+// The error is only for unexpected failures (500).
+func (s *server) book(ctx context.Context, q querier, in bookingRequest) (int, []byte, error) {
+	slotID, name := strings.TrimSpace(in.SlotID), strings.TrimSpace(in.Name)
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if slotID == "" || name == "" || email == "" {
+		return errorBody(http.StatusBadRequest, "slot_id, name and email are required")
+	}
+	if !validEmail(email) {
+		return errorBody(http.StatusBadRequest, "email is not valid")
+	}
+
+	b, err := createBooking(ctx, q, slotID, name, email)
+	switch {
+	case errors.Is(err, errNotFound):
+		return errorBody(http.StatusNotFound, "slot not found")
+	case errors.Is(err, errSlotStarted):
+		return errorBody(http.StatusBadRequest, "slot has already started")
+	case errors.Is(err, errSlotTaken):
+		return errorBody(http.StatusConflict, "slot already booked")
+	case err != nil:
+		return 0, nil, err
+	}
+	body, err := json.Marshal(b)
+	return http.StatusCreated, body, err
+}
+
+func errorBody(status int, msg string) (int, []byte, error) {
+	body, err := json.Marshal(map[string]string{"error": msg})
+	return status, body, err
+}
+
+func (s *server) handleListBookings(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	email := strings.ToLower(strings.TrimSpace(q.Get("email")))
+	if email == "" {
+		writeError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	limit := 10
+	if q.Has("limit") {
+		n, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || n < 1 || n > 50 {
+			writeError(w, http.StatusBadRequest, "limit must be an integer from 1 to 50")
+			return
+		}
+		limit = n
+	}
+	var after int64
+	if c := q.Get("cursor"); c != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(c)
+		if err == nil {
+			after, err = strconv.ParseInt(string(raw), 10, 64)
+		}
+		if err != nil || after < 1 {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
+	}
+
+	bookings, next, err := s.listBookings(r.Context(), email, after, limit)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+	var nextCursor *string // nil encodes as null on the last page
+	if next > 0 {
+		c := base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(next, 10)))
+		nextCursor = &c
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bookings": bookings, "next_cursor": nextCursor})
 }
 
 func (s *server) handleCancelBooking(w http.ResponseWriter, r *http.Request) {

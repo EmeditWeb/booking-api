@@ -54,9 +54,9 @@ CREATE INDEX bookings_email_seq ON bookings (email, seq);
 
 CREATE TABLE idempotency_keys (           -- Level 4
   key          TEXT PRIMARY KEY,
-  request_hash TEXT NOT NULL,             -- sha256 of normalised body
+  request_hash TEXT NOT NULL,             -- sha256 of the body's field values
   status_code  INT  NOT NULL,
-  response     JSONB NOT NULL,
+  response     BYTEA NOT NULL,            -- exact bytes, so replays are byte-identical
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -107,7 +107,7 @@ email := lower(trim(in.email)) ; name := trim(in.name) ; slotID := trim(in.slot_
 idemKey := header["Idempotency-Key"]
 if idemKey != "":
     TX begins; pg_advisory_xact_lock(hash(idemKey))       # serialises concurrent retries of the same key
-    hash := sha256(canonical(slotID, name, email))
+    hash := sha256(slot_id, name, email as received)   # formatting / key order don't matter
     if row := SELECT FROM idempotency_keys WHERE key = idemKey:
         if row.request_hash != hash: 422 {"error":"idempotency key reused with a different body"}
         else: replay row.status_code + row.response       # same status, same booking id

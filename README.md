@@ -21,7 +21,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 | 1 | List slots, book one, look up a booking | ✅ |
 | 2 | API key on every request; reject missing or invalid booking details | ✅ |
 | 3 | No double booking, even for simultaneous requests; cancellation | ✅ |
-| 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ⏳ |
+| 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ✅ |
 | 5 | Rate limit: 5 booking attempts per email per minute | ⏳ |
 | — | Web page | ⏳ |
 | — | Deployed over HTTPS | ⏳ |
@@ -76,7 +76,7 @@ A "check if free, then insert" in Go has a race: two requests can both see the s
 
 ### Safe retries (level 4)
 
-The client sends an `Idempotency-Key`, and the server stores that key with a SHA-256 of the normalised body and the exact response it sent. A retry with the same key and body replays the stored response: same status, same booking id, no new row. The same key with a different body gets **422**. A Postgres advisory lock on the key, held for the whole transaction, makes two simultaneous retries line up instead of both booking.
+The client sends an `Idempotency-Key`, and the server stores that key with a SHA-256 of the body's field values (so whitespace and key order don't matter) and the exact bytes of the response it sent. A retry with the same key and body replays the stored response: same status, same booking id, no new row. The same key with a different body gets **422**. A Postgres advisory lock on the key, held for the whole transaction, makes two simultaneous retries line up instead of both booking. The booking and the stored response commit in the same transaction, so a crash can never leave one without the other.
 
 ### Pagination (level 4)
 

@@ -354,3 +354,159 @@ func TestLevel3ConcurrentCancel(t *testing.T) {
 		t.Fatalf("want one 200 and %d 409s, got %v", n-1, count)
 	}
 }
+
+// manySlots resets the API to n future slots s0..s(n-1).
+func manySlots(t *testing.T, ts *httptest.Server, n int) {
+	t.Helper()
+	var slots []string
+	for i := 0; i < n; i++ {
+		start := time.Now().UTC().Add(time.Duration(24+i) * time.Hour).Format(time.RFC3339)
+		end := time.Now().UTC().Add(time.Duration(25+i) * time.Hour).Format(time.RFC3339)
+		slots = append(slots, fmt.Sprintf(`{"id":"s%d","provider":"Dr Ade","start":"%s","end":"%s"}`, i, start, end))
+	}
+	if code, out := call(t, ts, "POST", "/reset", `{"slots":[`+strings.Join(slots, ",")+`]}`); code != 200 {
+		t.Fatalf("reset: %d %v", code, out)
+	}
+}
+
+func TestLevel4Idempotency(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	body := `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`
+
+	code, first := call(t, ts, "POST", "/bookings", body, "Idempotency-Key", "k1")
+	if code != 201 {
+		t.Fatalf("first: %d %v", code, first)
+	}
+	for i := 0; i < 3; i++ {
+		code, again := call(t, ts, "POST", "/bookings", body, "Idempotency-Key", "k1")
+		if code != 201 || again["id"] != first["id"] || again["created_at"] != first["created_at"] {
+			t.Errorf("retry %d: %d %v, want 201 %v", i, code, again, first["id"])
+		}
+	}
+	// same body, whitespace and key order differ: still the same request
+	if code, again := call(t, ts, "POST", "/bookings", `{ "email":"ada@example.com", "name":"Ada", "slot_id":"s1" }`, "Idempotency-Key", "k1"); code != 201 || again["id"] != first["id"] {
+		t.Errorf("reformatted body: %d %v", code, again)
+	}
+	if code, out := call(t, ts, "POST", "/bookings", `{"slot_id":"s2","name":"Ada","email":"ada@example.com"}`, "Idempotency-Key", "k1"); code != 422 || out["error"] == nil {
+		t.Errorf("same key, different body: %d %v", code, out)
+	}
+	if _, list := call(t, ts, "GET", "/bookings?email=ada@example.com", ""); len(list["bookings"].([]any)) != 1 {
+		t.Errorf("retries created extra bookings: %v", list)
+	}
+
+	// failures replay too: same status, no new booking even if the slot later frees up
+	if code, _ := call(t, ts, "POST", "/bookings", `{"slot_id":"nope","name":"Ada","email":"ada@example.com"}`, "Idempotency-Key", "k2"); code != 404 {
+		t.Errorf("k2 first: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/bookings", `{"slot_id":"nope","name":"Ada","email":"ada@example.com"}`, "Idempotency-Key", "k2"); code != 404 {
+		t.Errorf("k2 replay: %d", code)
+	}
+
+	// a different key is a different request
+	if code, _ := call(t, ts, "POST", "/bookings", body, "Idempotency-Key", "k3"); code != 409 {
+		t.Errorf("new key for taken slot: %d", code)
+	}
+	if code, _ := call(t, ts, "POST", "/bookings", body, "Idempotency-Key", strings.Repeat("x", 256)); code != 400 {
+		t.Errorf("oversized key: %d", code)
+	}
+}
+
+func TestLevel4IdempotencyConcurrent(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	const n = 20
+	ids := make(chan string, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			code, b := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`, "Idempotency-Key", "same")
+			if code != 201 {
+				t.Errorf("concurrent retry: %d %v", code, b)
+				return
+			}
+			ids <- b["id"].(string)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(ids)
+	seen := map[string]bool{}
+	for id := range ids {
+		seen[id] = true
+	}
+	if len(seen) != 1 {
+		t.Fatalf("want one booking id across concurrent retries, got %v", seen)
+	}
+}
+
+func TestLevel4Pagination(t *testing.T) {
+	ts := newTestServer(t)
+	manySlots(t, ts, 26)
+	var want []string
+	for i := 0; i < 23; i++ {
+		email := "ada@example.com"
+		if i%2 == 1 {
+			email = "ADA@Example.com" // stored lower-cased, so same person
+		}
+		_, b := call(t, ts, "POST", "/bookings", fmt.Sprintf(`{"slot_id":"s%d","name":"Ada","email":"%s"}`, i, email))
+		want = append(want, b["id"].(string))
+	}
+	call(t, ts, "POST", "/bookings", `{"slot_id":"s23","name":"Bo","email":"bo@example.com"}`)
+	call(t, ts, "DELETE", "/bookings/"+want[5], "") // cancelled bookings are still listed
+
+	var got []string
+	cursor, pages := "", 0
+	for {
+		path := "/bookings?email=" + "Ada@Example.COM" + "&limit=10"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		code, page := call(t, ts, "GET", path, "")
+		if code != 200 {
+			t.Fatalf("page %d: %d %v", pages, code, page)
+		}
+		pages++
+		for _, b := range page["bookings"].([]any) {
+			got = append(got, b.(map[string]any)["id"].(string))
+		}
+		next, present := page["next_cursor"]
+		if !present {
+			t.Fatal("next_cursor key missing")
+		}
+		if next == nil {
+			break
+		}
+		cursor = next.(string)
+	}
+	if pages != 3 || strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("pages=%d\n got  %v\n want %v", pages, got, want)
+	}
+
+	if _, page := call(t, ts, "GET", "/bookings?email=ada@example.com", ""); len(page["bookings"].([]any)) != 10 {
+		t.Errorf("default limit should be 10, got %d", len(page["bookings"].([]any)))
+	}
+	if _, page := call(t, ts, "GET", "/bookings?email=ada@example.com&limit=23", ""); len(page["bookings"].([]any)) != 23 || page["next_cursor"] != nil {
+		t.Errorf("exact-fit page must end with null cursor: %v", page["next_cursor"])
+	}
+	if _, page := call(t, ts, "GET", "/bookings?email=nobody@example.com", ""); page["bookings"] == nil || len(page["bookings"].([]any)) != 0 || page["next_cursor"] != nil {
+		t.Errorf("unknown email: %v", page)
+	}
+	for _, q := range []string{"limit=0", "limit=51", "limit=-1", "limit=abc", "limit=1.5", "limit=", "cursor=%21%21", "cursor=bm9wZQ"} {
+		if code, body := call(t, ts, "GET", "/bookings?email=ada@example.com&"+q, ""); code != 400 || body["error"] == nil {
+			t.Errorf("%s: got %d %v", q, code, body)
+		}
+	}
+	if code, _ := call(t, ts, "GET", "/bookings", ""); code != 400 {
+		t.Errorf("missing email: %d", code)
+	}
+	for _, q := range []string{"limit=1", "limit=50"} {
+		if code, _ := call(t, ts, "GET", "/bookings?email=ada@example.com&"+q, ""); code != 200 {
+			t.Errorf("%s should be allowed: %d", q, code)
+		}
+	}
+}

@@ -25,6 +25,6 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   key          TEXT PRIMARY KEY,
   request_hash TEXT NOT NULL,
   status_code  INT NOT NULL,
-  response     JSONB NOT NULL,
+  response     BYTEA NOT NULL, -- exact bytes sent, so a replay is byte-identical
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
