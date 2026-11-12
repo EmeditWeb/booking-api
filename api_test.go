@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,14 @@ func TestResetValidation(t *testing.T) {
 	// past slots are allowed, and an empty list is valid
 	if code, _ := call(t, ts, "POST", "/reset", `{"slots":[{"id":"old","provider":"A","start":"2020-01-01T09:00:00Z","end":"2020-01-01T09:30:00Z"}]}`); code != 200 {
 		t.Errorf("past slot rejected: %d", code)
+	}
+	// a realistic clinic schedule (500 slots, ~60 KB) must fit in the body limit
+	var many []string
+	for i := 0; i < 500; i++ {
+		many = append(many, fmt.Sprintf(`{"id":"x%d","provider":"Dr Ade","start":"2027-01-01T09:00:00Z","end":"2027-01-01T09:30:00Z"}`, i))
+	}
+	if code, out := call(t, ts, "POST", "/reset", `{"slots":[`+strings.Join(many, ",")+`]}`); code != 200 {
+		t.Errorf("500-slot reset: %d %v", code, out)
 	}
 	if code, _ := call(t, ts, "POST", "/reset", `{"slots":[]}`); code != 200 {
 		t.Errorf("empty slot list rejected: %d", code)

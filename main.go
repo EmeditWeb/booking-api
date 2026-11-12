@@ -73,5 +73,5 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
-	return http.MaxBytesHandler(mux, 16<<10)
+	return http.MaxBytesHandler(mux, 1<<20) // 1 MB: room for a large /reset, still bounded
 }
