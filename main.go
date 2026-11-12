@@ -64,10 +64,14 @@ func openDB(ctx context.Context, url string) (*pgxpool.Pool, error) {
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /reset", s.handleReset)
+	mux.HandleFunc("GET /slots", s.handleListSlots)
+	mux.HandleFunc("POST /bookings", s.handleCreateBooking)
+	mux.HandleFunc("GET /bookings/{id}", s.handleGetBooking)
 	mux.HandleFunc("GET /docs", serveDocs)
 	mux.HandleFunc("GET /openapi.json", serveSpec)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
-	return http.MaxBytesHandler(mux, 16<<10)
+	return http.MaxBytesHandler(mux, 1<<20) // 1 MB: room for a large /reset, still bounded
 }
