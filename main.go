@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"fmt"
 	"log"
@@ -73,5 +74,19 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
-	return http.MaxBytesHandler(mux, 1<<20) // 1 MB: room for a large /reset, still bounded
+	return http.MaxBytesHandler(s.requireAPIKey(mux), 1<<20) // 1 MB: room for a large /reset, still bounded
+}
+
+// publicPaths are the web page and API docs; every other path, including unknown ones, needs the key.
+var publicPaths = map[string]bool{"/": true, "/docs": true, "/openapi.json": true}
+
+func (s *server) requireAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		if !publicPaths[r.URL.Path] && subtle.ConstantTimeCompare([]byte(key), []byte(s.apiKey)) != 1 {
+			writeError(w, http.StatusUnauthorized, "missing or invalid API key")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

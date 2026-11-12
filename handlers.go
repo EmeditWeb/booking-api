@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/mail"
+	"strings"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -66,15 +68,41 @@ func (s *server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		Email  string `json:"email"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, http.StatusBadRequest, "body must be JSON with string fields slot_id, name and email")
 		return
 	}
-	b, err := s.insertBooking(r.Context(), in.SlotID, in.Name, in.Email)
-	if err != nil {
+	slotID, name := strings.TrimSpace(in.SlotID), strings.TrimSpace(in.Name)
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if slotID == "" || name == "" || email == "" {
+		writeError(w, http.StatusBadRequest, "slot_id, name and email are required")
+		return
+	}
+	if !validEmail(email) {
+		writeError(w, http.StatusBadRequest, "email is not valid")
+		return
+	}
+
+	b, err := s.createBooking(r.Context(), slotID, name, email)
+	switch {
+	case errors.Is(err, errNotFound):
+		writeError(w, http.StatusNotFound, "slot not found")
+	case errors.Is(err, errSlotStarted):
+		writeError(w, http.StatusBadRequest, "slot has already started")
+	case err != nil:
 		serverError(w, r, err)
-		return
+	default:
+		writeJSON(w, http.StatusCreated, b)
 	}
-	writeJSON(w, http.StatusCreated, b)
+}
+
+// validEmail accepts a bare address (no display name) whose domain has a dot, e.g. ada@example.com.
+func validEmail(e string) bool {
+	addr, err := mail.ParseAddress(e)
+	if err != nil || addr.Address != e || len(e) > 254 {
+		return false
+	}
+	domain := e[strings.LastIndex(e, "@")+1:]
+	return strings.Contains(domain, ".") && !strings.HasSuffix(domain, ".")
 }
 
 func (s *server) handleGetBooking(w http.ResponseWriter, r *http.Request) {
