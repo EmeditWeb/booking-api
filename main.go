@@ -20,8 +20,19 @@ var schemaSQL string
 var openapiJSON []byte
 
 type server struct {
-	db     *pgxpool.Pool
-	apiKey string
+	db         *pgxpool.Pool
+	apiKey     string
+	emailLimit *limiter // spec: 5 booking attempts per email per minute
+	ipLimit    *limiter // flood guard on every route; generous so legitimate bursts never hit it
+}
+
+func newServer(db *pgxpool.Pool, apiKey string) *server {
+	return &server{
+		db:         db,
+		apiKey:     apiKey,
+		emailLimit: newLimiter(5, time.Minute),
+		ipLimit:    newLimiter(1000, 10*time.Second),
+	}
 }
 
 func main() {
@@ -43,7 +54,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           (&server{db: db, apiKey: apiKey}).routes(),
+		Handler:           newServer(db, apiKey).routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("listening on :%s", port)
@@ -76,7 +87,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
-	return http.MaxBytesHandler(s.requireAPIKey(mux), 1<<20) // 1 MB: room for a large /reset, still bounded
+	// IP limit first, so it also throttles API-key guessing.
+	return s.limitByIP(http.MaxBytesHandler(s.requireAPIKey(mux), 1<<20)) // 1 MB: room for a large /reset, still bounded
 }
 
 // publicPaths are the web page and API docs; every other path, including unknown ones, needs the key.
