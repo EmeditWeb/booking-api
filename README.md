@@ -17,7 +17,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 
 | Level | Requirement | Status |
 |-------|-------------|--------|
-| 0 | Scaffold: config, database, schema, Swagger docs, Dockerfile | 🚧 in progress |
+| 0 | Scaffold: config, database, schema, Swagger docs, Dockerfile | ✅ |
 | 1 | List slots, book one, look up a booking | ⏳ |
 | 2 | API key on every request; reject missing or invalid booking details | ⏳ |
 | 3 | No double booking, even for simultaneous requests; cancellation | ⏳ |
@@ -143,6 +143,7 @@ schema.sql       tables and indexes (embedded, idempotent)
 web/index.html   the booking page (embedded)
 docs/            official OpenAPI spec and implementation plan
 api_test.go      end-to-end tests against Postgres
+Dockerfile       two-stage build into a distroless image (~19 MB)
 ```
 
 Design notes and pseudocode: [`docs/PLAN.md`](docs/PLAN.md).
