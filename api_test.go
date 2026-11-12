@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +18,7 @@ import (
 const testKey = "test-key"
 
 // newTestServer returns a running server backed by TEST_DATABASE_URL with an empty database.
-func newTestServer(t *testing.T) *httptest.Server {
+func newTestServer(t *testing.T, opts ...func(*server)) *httptest.Server {
 	t.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -30,7 +31,11 @@ func newTestServer(t *testing.T) *httptest.Server {
 	if _, err := db.Exec(context.Background(), "TRUNCATE slots, bookings, idempotency_keys"); err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer((&server{db: db, apiKey: testKey}).routes())
+	s := newServer(db, testKey)
+	for _, opt := range opts {
+		opt(s)
+	}
+	ts := httptest.NewServer(s.routes())
 	t.Cleanup(func() { ts.Close(); db.Close() })
 	return ts
 }
@@ -207,8 +212,11 @@ func TestLevel2APIKey(t *testing.T) {
 	}
 }
 
+// noEmailLimit lifts the Level 5 per-email limit for tests that make many attempts for one person.
+func noEmailLimit(s *server) { s.emailLimit = newLimiter(1000, time.Minute) }
+
 func TestLevel2Validation(t *testing.T) {
-	ts := newTestServer(t)
+	ts := newTestServer(t, noEmailLimit)
 	seed(t, ts)
 	cases := []struct {
 		name, body string
@@ -445,7 +453,7 @@ func TestLevel4IdempotencyConcurrent(t *testing.T) {
 }
 
 func TestLevel4Pagination(t *testing.T) {
-	ts := newTestServer(t)
+	ts := newTestServer(t, noEmailLimit)
 	manySlots(t, ts, 26)
 	var want []string
 	for i := 0; i < 23; i++ {
@@ -507,6 +515,99 @@ func TestLevel4Pagination(t *testing.T) {
 	for _, q := range []string{"limit=1", "limit=50"} {
 		if code, _ := call(t, ts, "GET", "/bookings?email=ada@example.com&"+q, ""); code != 200 {
 			t.Errorf("%s should be allowed: %d", q, code)
+		}
+	}
+}
+
+// postStatus posts a booking and returns the status and Retry-After header.
+func postStatus(t *testing.T, ts *httptest.Server, body string, headers ...string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", ts.URL+"/bookings", strings.NewReader(body))
+	req.Header.Set("X-API-Key", testKey)
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	return res.StatusCode, res.Header.Get("Retry-After")
+}
+
+func TestLevel5PerEmailLimit(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	call(t, ts, "POST", "/bookings", `{"slot_id":"s2","name":"Taken","email":"other@example.com"}`)
+
+	// five attempts, mostly failures: they all count
+	attempts := []struct {
+		body string
+		want int
+	}{
+		{`{"slot_id":"nope","name":"Ada","email":"ada@example.com"}`, 404},
+		{`{"slot_id":"s2","name":"Ada","email":"ada@example.com"}`, 409},
+		{`{"slot_id":"s1","name":"","email":"ada@example.com"}`, 400},
+		{`{"slot_id":"s1","name":"Ada","email":"  ADA@Example.com "}`, 201}, // same person after normalising
+		{`{"slot_id":"s3","name":"Ada","email":"ada@example.com"}`, 201},
+	}
+	for i, a := range attempts {
+		if code, _ := postStatus(t, ts, a.body); code != a.want {
+			t.Fatalf("attempt %d: got %d, want %d", i+1, code, a.want)
+		}
+	}
+	code, retry := postStatus(t, ts, `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`)
+	if n, err := strconv.Atoi(retry); code != 429 || err != nil || n < 1 || n > 60 {
+		t.Fatalf("6th attempt: %d Retry-After=%q, want 429 with 1..60", code, retry)
+	}
+	if code, body := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`); code != 429 || body["error"] == nil {
+		t.Errorf("429 body: %d %v", code, body)
+	}
+	if code, _ := postStatus(t, ts, `{"slot_id":"s1","name":"Bo","email":"bo@example.com"}`); code != 409 {
+		t.Errorf("other emails must not be rate limited (s1 is taken, so 409 expected): %d", code)
+	}
+
+	// /reset starts every email afresh
+	seed(t, ts)
+	if code, _ := postStatus(t, ts, `{"slot_id":"s1","name":"Ada","email":"ada@example.com"}`); code != 201 {
+		t.Errorf("after reset: %d", code)
+	}
+}
+
+func TestLevel5ReplaysDontCount(t *testing.T) {
+	ts := newTestServer(t)
+	manySlots(t, ts, 6)
+	body := `{"slot_id":"s0","name":"Ada","email":"ada@example.com"}`
+	for i := 0; i < 8; i++ { // 1 real attempt + 7 replays
+		if code, _ := postStatus(t, ts, body, "Idempotency-Key", "k"); code != 201 {
+			t.Fatalf("replay %d: %d", i, code)
+		}
+	}
+	for i := 1; i <= 4; i++ { // attempts 2..5
+		if code, _ := postStatus(t, ts, fmt.Sprintf(`{"slot_id":"s%d","name":"Ada","email":"ada@example.com"}`, i)); code != 201 {
+			t.Fatalf("attempt %d: %d", i+1, code)
+		}
+	}
+	if code, _ := postStatus(t, ts, `{"slot_id":"s5","name":"Ada","email":"ada@example.com"}`, "Idempotency-Key", "k2"); code != 429 {
+		t.Errorf("6th real attempt: %d", code)
+	}
+	// a 429 isn't stored, so the same key works once the window allows it
+	if code, _ := postStatus(t, ts, body, "Idempotency-Key", "k"); code != 201 {
+		t.Errorf("replay while limited: %d", code)
+	}
+}
+
+func TestPerIPLimitOnEveryRoute(t *testing.T) {
+	ts := newTestServer(t, func(s *server) { s.ipLimit = newLimiter(3, time.Minute) })
+	for _, path := range []string{"/openapi.json", "/slots", "/bookings/x"} {
+		if code, _ := call(t, ts, "GET", path, ""); code == 429 {
+			t.Fatalf("%s limited too early", path)
+		}
+	}
+	for _, path := range []string{"/docs", "/slots", "/bookings/x", "/nope"} {
+		code, body := call(t, ts, "GET", path, "", "X-API-Key", "")
+		if code != 429 || body["error"] == nil {
+			t.Errorf("%s over the IP limit (even without a key): %d %v", path, code, body)
 		}
 	}
 }

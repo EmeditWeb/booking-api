@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -161,14 +162,14 @@ func (s *server) getBooking(ctx context.Context, id string) (Booking, error) {
 // once runs fn at most once per idempotency key. A repeat with the same request hash gets the
 // stored response; a different hash gets errKeyReused. The booking and the stored response
 // commit together, and an advisory lock on the key makes concurrent repeats wait for the first.
-func (s *server) once(ctx context.Context, key, hash string, fn func(querier) (int, []byte, error)) (status int, body []byte, err error) {
+func (s *server) once(ctx context.Context, key, hash string, fn func(querier) (reply, error)) (rep reply, err error) {
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key); err != nil {
 			return fmt.Errorf("lock idempotency key: %w", err)
 		}
 		var storedHash string
 		err := tx.QueryRow(ctx, "SELECT request_hash, status_code, response FROM idempotency_keys WHERE key = $1", key).
-			Scan(&storedHash, &status, &body)
+			Scan(&storedHash, &rep.status, &rep.body)
 		if err == nil && storedHash != hash {
 			return errKeyReused
 		}
@@ -181,10 +182,10 @@ func (s *server) once(ctx context.Context, key, hash string, fn func(querier) (i
 		if err != nil {
 			return fmt.Errorf("savepoint: %w", err)
 		}
-		if status, body, err = fn(sp); err != nil {
+		if rep, err = fn(sp); err != nil {
 			return err
 		}
-		if status >= 400 {
+		if rep.status >= 400 {
 			err = sp.Rollback(ctx)
 		} else {
 			err = sp.Commit(ctx)
@@ -192,11 +193,14 @@ func (s *server) once(ctx context.Context, key, hash string, fn func(querier) (i
 		if err != nil {
 			return fmt.Errorf("end savepoint: %w", err)
 		}
+		if rep.status == http.StatusTooManyRequests {
+			return nil // not an outcome: the same key may try again once the limit allows
+		}
 		_, err = tx.Exec(ctx, "INSERT INTO idempotency_keys (key, request_hash, status_code, response) VALUES ($1, $2, $3, $4)",
-			key, hash, status, body)
+			key, hash, rep.status, rep.body)
 		return err
 	})
-	return status, body, err
+	return rep, err
 }
 
 // listBookings returns up to limit bookings for email with seq > after, oldest first,

@@ -12,6 +12,7 @@ import (
 	"net/mail"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -54,6 +55,7 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, err)
 		return
 	}
+	s.emailLimit.reset() // a fresh start for booking attempts too
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -90,13 +92,12 @@ func (s *server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var status int
-	var body []byte
+	var rep reply
 	var err error
 	if key == "" {
-		status, body, err = s.book(r.Context(), s.db, in)
+		rep, err = s.book(r.Context(), s.db, in)
 	} else {
-		status, body, err = s.once(r.Context(), key, in.hash(), func(q querier) (int, []byte, error) {
+		rep, err = s.once(r.Context(), key, in.hash(), func(q querier) (reply, error) {
 			return s.book(r.Context(), q, in)
 		})
 	}
@@ -106,17 +107,34 @@ func (s *server) handleCreateBooking(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		serverError(w, r, err)
 	default:
+		if rep.retryAfter != "" {
+			w.Header().Set("Retry-After", rep.retryAfter)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		w.Write(body)
+		w.WriteHeader(rep.status)
+		w.Write(rep.body)
 	}
 }
 
-// book validates and creates a booking, returning the status and JSON body to send.
+// reply is a response that can be stored and replayed for an Idempotency-Key.
+type reply struct {
+	status     int
+	body       []byte
+	retryAfter string // set only on 429, which is never stored
+}
+
+// book rate-limits, validates and creates a booking, returning the response to send.
 // The error is only for unexpected failures (500).
-func (s *server) book(ctx context.Context, q querier, in bookingRequest) (int, []byte, error) {
+func (s *server) book(ctx context.Context, q querier, in bookingRequest) (reply, error) {
 	slotID, name := strings.TrimSpace(in.SlotID), strings.TrimSpace(in.Name)
 	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if email != "" { // every attempt counts, including ones that fail validation below
+		if ok, wait := s.emailLimit.allow(email, time.Now()); !ok {
+			rep, err := errorBody(http.StatusTooManyRequests, "too many booking attempts for this email, try again later")
+			rep.retryAfter = retryAfterSeconds(wait)
+			return rep, err
+		}
+	}
 	if slotID == "" || name == "" || email == "" {
 		return errorBody(http.StatusBadRequest, "slot_id, name and email are required")
 	}
@@ -133,15 +151,15 @@ func (s *server) book(ctx context.Context, q querier, in bookingRequest) (int, [
 	case errors.Is(err, errSlotTaken):
 		return errorBody(http.StatusConflict, "slot already booked")
 	case err != nil:
-		return 0, nil, err
+		return reply{}, err
 	}
 	body, err := json.Marshal(b)
-	return http.StatusCreated, body, err
+	return reply{status: http.StatusCreated, body: body}, err
 }
 
-func errorBody(status int, msg string) (int, []byte, error) {
+func errorBody(status int, msg string) (reply, error) {
 	body, err := json.Marshal(map[string]string{"error": msg})
-	return status, body, err
+	return reply{status: status, body: body}, err
 }
 
 func (s *server) handleListBookings(w http.ResponseWriter, r *http.Request) {

@@ -22,7 +22,7 @@ It's built to the [Koya Academy assessment spec](https://koyaacademy.com/assessm
 | 2 | API key on every request; reject missing or invalid booking details | ✅ |
 | 3 | No double booking, even for simultaneous requests; cancellation | ✅ |
 | 4 | Idempotent retries (`Idempotency-Key`); cursor pagination of a person's bookings | ✅ |
-| 5 | Rate limit: 5 booking attempts per email per minute | ⏳ |
+| 5 | Rate limit: 5 booking attempts per email per minute, plus a per-IP flood guard on every route | ✅ |
 | — | Web page | ⏳ |
 | — | Deployed over HTTPS | ⏳ |
 
@@ -84,12 +84,16 @@ Pagination is keyset (cursor) based, not `OFFSET`. Each booking has an increasin
 
 ### Rate limiting (level 5)
 
-Each email gets at most 5 booking attempts in any rolling 60 seconds, failed attempts included. The 6th returns **429** with `Retry-After` set to the whole seconds until the oldest attempt leaves the window. Emails are trimmed and lower-cased first, so `ADA@x.com ` and `ada@x.com` share one budget. Idempotent replays don't count, because a retry is the same attempt.
+Each email gets at most 5 booking attempts in any rolling 60 seconds, failed attempts included. The 6th returns **429** with `Retry-After` set to the whole seconds until the oldest attempt leaves the window. Emails are trimmed and lower-cased first, so `ADA@x.com ` and `ada@x.com` share one budget. Idempotent replays don't count, because a retry is the same attempt, and `/reset` clears the history.
+
+Separately, **every route** (including the public page and docs) has a per-IP flood guard of 1,000 requests per 10 seconds. It sits in front of the API-key check, so it also slows down key guessing. It's set high on purpose: a real client or a test suite firing 50 parallel bookings never comes close, but a script hammering the server does. The client IP comes from the *last* `X-Forwarded-For` hop, the one our hosting proxy adds, because the first hop is whatever the client claims.
+
+Both limiters are in-memory sliding windows, which is right for a single instance. With more instances they'd move to Postgres or Redis.
 
 ### Order of checks in `POST /bookings`
 
 ```
-API key → idempotency replay → rate limit → required fields / email format (400)
+IP flood guard → API key → idempotency replay → per-email rate limit → required fields / email format (400)
        → slot exists (404) → slot not started (400) → insert (201 / 409) → store idempotent response
 ```
 
@@ -139,10 +143,12 @@ Deliberately flat. It's one small service, so there are no layers until somethin
 main.go          config, startup, routing, middleware
 handlers.go      HTTP handlers and JSON helpers
 store.go         all SQL
+ratelimit.go     sliding-window limiter, per-IP middleware
 schema.sql       tables and indexes (embedded, idempotent)
 web/index.html   the booking page (embedded)
 docs/            official OpenAPI spec and implementation plan
 api_test.go      end-to-end tests against Postgres
+ratelimit_test.go limiter unit tests with a fake clock
 Dockerfile       two-stage build into a distroless image (~19 MB)
 ```
 

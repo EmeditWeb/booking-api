@@ -11,7 +11,7 @@ Spec: https://koyaacademy.com/assessment-api/openapi.json (OpenAPI 3.0.3, mirror
 | Host     | Render (free web service, Docker) | HTTPS out of the box, long-running process |
 | Web page | Static HTML/JS embedded with `embed.FS`, served by the same Go binary at `/` | Same origin → no CORS, one deploy |
 | Schema   | One embedded `schema.sql` with `IF NOT EXISTS`, run on startup | No migration tool for 3 tables |
-| Rate limit | In-memory mutex map | One instance on Render; shortcut noted in code |
+| Rate limit | In-memory sliding windows: 5/email/min on bookings (spec) + 1000/IP/10s on every route (flood guard) | One instance on Render; shortcut noted in code |
 | API docs | Swagger UI (jsdelivr CDN) at `/docs`, loading the official spec served at `/openapi.json` | Docs are the graded contract itself, can't drift; Try-it-out works live for the demo |
 | Layout   | One `package main`: `main.go`, `handlers.go`, `store.go`, `schema.sql`, `web/index.html` | Ponytail: no layers until needed |
 
