@@ -38,7 +38,13 @@ var (
 	errSlotStarted = errors.New("slot has already started")
 	errSlotTaken   = errors.New("slot already booked")
 	errCancelled   = errors.New("booking already cancelled")
+	errKeyReused   = errors.New("idempotency key reused with a different body")
 )
+
+// querier is satisfied by the pool and by a transaction, so booking can run inside either.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 const bookingCols = "id, slot_id, name, email, status, created_at"
 
@@ -105,9 +111,9 @@ func (s *server) listSlots(ctx context.Context, provider string) ([]SlotWithAvai
 }
 
 // createBooking books a slot. It returns errNotFound for an unknown slot and errSlotStarted for a past one.
-func (s *server) createBooking(ctx context.Context, slotID, name, email string) (Booking, error) {
+func createBooking(ctx context.Context, q querier, slotID, name, email string) (Booking, error) {
 	var started bool
-	err := s.db.QueryRow(ctx, "SELECT start_at <= now() FROM slots WHERE id = $1", slotID).Scan(&started)
+	err := q.QueryRow(ctx, "SELECT start_at <= now() FROM slots WHERE id = $1", slotID).Scan(&started)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Booking{}, errNotFound
 	}
@@ -117,7 +123,7 @@ func (s *server) createBooking(ctx context.Context, slotID, name, email string) 
 	if started {
 		return Booking{}, errSlotStarted
 	}
-	b, err := scanBooking(s.db.QueryRow(ctx, `
+	b, err := scanBooking(q.QueryRow(ctx, `
 		INSERT INTO bookings (id, slot_id, name, email, status)
 		VALUES ($1, $2, $3, $4, 'confirmed')
 		RETURNING `+bookingCols, newID(), slotID, name, email))
@@ -150,4 +156,73 @@ func (s *server) cancelBooking(ctx context.Context, id string) (Booking, error) 
 
 func (s *server) getBooking(ctx context.Context, id string) (Booking, error) {
 	return scanBooking(s.db.QueryRow(ctx, "SELECT "+bookingCols+" FROM bookings WHERE id = $1", id))
+}
+
+// once runs fn at most once per idempotency key. A repeat with the same request hash gets the
+// stored response; a different hash gets errKeyReused. The booking and the stored response
+// commit together, and an advisory lock on the key makes concurrent repeats wait for the first.
+func (s *server) once(ctx context.Context, key, hash string, fn func(querier) (int, []byte, error)) (status int, body []byte, err error) {
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key); err != nil {
+			return fmt.Errorf("lock idempotency key: %w", err)
+		}
+		var storedHash string
+		err := tx.QueryRow(ctx, "SELECT request_hash, status_code, response FROM idempotency_keys WHERE key = $1", key).
+			Scan(&storedHash, &status, &body)
+		if err == nil && storedHash != hash {
+			return errKeyReused
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err // nil means a replay of the stored response
+		}
+
+		// A savepoint, so a failed insert (e.g. slot taken) doesn't abort the transaction we store into.
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("savepoint: %w", err)
+		}
+		if status, body, err = fn(sp); err != nil {
+			return err
+		}
+		if status >= 400 {
+			err = sp.Rollback(ctx)
+		} else {
+			err = sp.Commit(ctx)
+		}
+		if err != nil {
+			return fmt.Errorf("end savepoint: %w", err)
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO idempotency_keys (key, request_hash, status_code, response) VALUES ($1, $2, $3, $4)",
+			key, hash, status, body)
+		return err
+	})
+	return status, body, err
+}
+
+// listBookings returns up to limit bookings for email with seq > after, oldest first,
+// and the seq to continue from (0 when there are no more).
+func (s *server) listBookings(ctx context.Context, email string, after int64, limit int) ([]Booking, int64, error) {
+	rows, err := s.db.Query(ctx, "SELECT seq, "+bookingCols+" FROM bookings WHERE email = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+		email, after, limit+1) // one extra row tells us whether another page exists
+	if err != nil {
+		return nil, 0, fmt.Errorf("list bookings: %w", err)
+	}
+	defer rows.Close()
+	bookings, seqs := []Booking{}, []int64{}
+	for rows.Next() {
+		var b Booking
+		var seq int64
+		if err := rows.Scan(&seq, &b.ID, &b.SlotID, &b.Name, &b.Email, &b.Status, &b.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("scan booking: %w", err)
+		}
+		b.CreatedAt = b.CreatedAt.UTC()
+		bookings, seqs = append(bookings, b), append(seqs, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list bookings: %w", err)
+	}
+	if len(bookings) <= limit {
+		return bookings, 0, nil
+	}
+	return bookings[:limit], seqs[limit-1], nil
 }
