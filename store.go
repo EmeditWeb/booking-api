@@ -33,7 +33,10 @@ type Booking struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-var errNotFound = errors.New("not found")
+var (
+	errNotFound    = errors.New("not found")
+	errSlotStarted = errors.New("slot has already started")
+)
 
 const bookingCols = "id, slot_id, name, email, status, created_at"
 
@@ -47,10 +50,15 @@ func scanBooking(row pgx.Row) (Booking, error) {
 	return b, err
 }
 
-func isUniqueViolation(err error) bool {
+func pgCode(err error) string {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
 }
+
+func isUniqueViolation(err error) bool { return pgCode(err) == "23505" }
 
 func newID() string {
 	b := make([]byte, 8)
@@ -94,11 +102,27 @@ func (s *server) listSlots(ctx context.Context, provider string) ([]SlotWithAvai
 	return slots, err
 }
 
-func (s *server) insertBooking(ctx context.Context, slotID, name, email string) (Booking, error) {
-	return scanBooking(s.db.QueryRow(ctx, `
+// createBooking books a slot. It returns errNotFound for an unknown slot and errSlotStarted for a past one.
+func (s *server) createBooking(ctx context.Context, slotID, name, email string) (Booking, error) {
+	var started bool
+	err := s.db.QueryRow(ctx, "SELECT start_at <= now() FROM slots WHERE id = $1", slotID).Scan(&started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Booking{}, errNotFound
+	}
+	if err != nil {
+		return Booking{}, fmt.Errorf("look up slot: %w", err)
+	}
+	if started {
+		return Booking{}, errSlotStarted
+	}
+	b, err := scanBooking(s.db.QueryRow(ctx, `
 		INSERT INTO bookings (id, slot_id, name, email, status)
 		VALUES ($1, $2, $3, $4, 'confirmed')
 		RETURNING `+bookingCols, newID(), slotID, name, email))
+	if pgCode(err) == "23503" { // slot removed by a concurrent /reset between the lookup and the insert
+		return b, errNotFound
+	}
+	return b, err
 }
 
 func (s *server) getBooking(ctx context.Context, id string) (Booking, error) {

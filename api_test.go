@@ -181,3 +181,81 @@ func TestResetValidation(t *testing.T) {
 		t.Errorf("empty slot list must be [], got %v", body)
 	}
 }
+
+func TestLevel2APIKey(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	routes := [][2]string{
+		{"POST", "/reset"}, {"GET", "/slots"}, {"POST", "/bookings"},
+		{"GET", "/bookings/bk_x"}, {"DELETE", "/bookings/bk_x"}, {"GET", "/bookings?email=a@b.co"},
+	}
+	for _, key := range []string{"", "wrong-key", testKey + "x"} {
+		for _, rt := range routes {
+			code, body := call(t, ts, rt[0], rt[1], `{}`, "X-API-Key", key)
+			if code != 401 || body["error"] == nil {
+				t.Errorf("%s %s with key %q: got %d %v", rt[0], rt[1], key, code, body)
+			}
+		}
+	}
+	for _, path := range []string{"/docs", "/openapi.json"} {
+		res, err := http.Get(ts.URL + path)
+		if err != nil || res.StatusCode != 200 {
+			t.Errorf("%s must be public: %v %v", path, err, res)
+		}
+		res.Body.Close()
+	}
+}
+
+func TestLevel2Validation(t *testing.T) {
+	ts := newTestServer(t)
+	seed(t, ts)
+	cases := []struct {
+		name, body string
+		want       int
+	}{
+		{"not json", `nope`, 400},
+		{"empty object", `{}`, 400},
+		{"missing slot_id", `{"name":"Ada","email":"ada@example.com"}`, 400},
+		{"missing name", `{"slot_id":"s1","email":"ada@example.com"}`, 400},
+		{"missing email", `{"slot_id":"s1","name":"Ada"}`, 400},
+		{"empty name", `{"slot_id":"s1","name":"","email":"ada@example.com"}`, 400},
+		{"whitespace name", `{"slot_id":"s1","name":"   ","email":"ada@example.com"}`, 400},
+		{"whitespace email", `{"slot_id":"s1","name":"Ada","email":"  "}`, 400},
+		{"wrong type", `{"slot_id":"s1","name":42,"email":"ada@example.com"}`, 400},
+		{"email no at", `{"slot_id":"s1","name":"Ada","email":"ada.example.com"}`, 400},
+		{"email no domain", `{"slot_id":"s1","name":"Ada","email":"ada@"}`, 400},
+		{"email no local", `{"slot_id":"s1","name":"Ada","email":"@example.com"}`, 400},
+		{"email no tld", `{"slot_id":"s1","name":"Ada","email":"ada@example"}`, 400},
+		{"email with space", `{"slot_id":"s1","name":"Ada","email":"ada obi@example.com"}`, 400},
+		{"email display name", `{"slot_id":"s1","name":"Ada","email":"Ada <ada@example.com>"}`, 400},
+		{"email two ats", `{"slot_id":"s1","name":"Ada","email":"a@b@example.com"}`, 400},
+		{"invalid email beats unknown slot", `{"slot_id":"nope","name":"Ada","email":"bad"}`, 400},
+		{"unknown slot", `{"slot_id":"nope","name":"Ada","email":"ada@example.com"}`, 404},
+	}
+	for _, c := range cases {
+		if code, body := call(t, ts, "POST", "/bookings", c.body); code != c.want || body["error"] == nil {
+			t.Errorf("%s: got %d %v, want %d", c.name, code, body, c.want)
+		}
+	}
+
+	// slot that has already started (and one in progress) → 400, but only after the 404 check
+	past := `{"slots":[
+		{"id":"old","provider":"Dr Ade","start":"2020-01-01T09:00:00Z","end":"2020-01-01T09:30:00Z"},
+		{"id":"now","provider":"Dr Ade","start":"` + time.Now().UTC().Add(-time.Minute).Format(time.RFC3339) + `","end":"` + time.Now().UTC().Add(time.Hour).Format(time.RFC3339) + `"}]}`
+	call(t, ts, "POST", "/reset", past)
+	for _, id := range []string{"old", "now"} {
+		if code, body := call(t, ts, "POST", "/bookings", `{"slot_id":"`+id+`","name":"Ada","email":"ada@example.com"}`); code != 400 || body["error"] == nil {
+			t.Errorf("started slot %s: got %d %v", id, code, body)
+		}
+	}
+
+	// trimming and lower-casing
+	seed(t, ts)
+	code, b := call(t, ts, "POST", "/bookings", `{"slot_id":"s1","name":"  Ada Obi  ","email":"  Ada.Obi@Example.COM "}`)
+	if code != 201 || b["name"] != "Ada Obi" || b["email"] != "ada.obi@example.com" {
+		t.Errorf("normalisation: %d %v", code, b)
+	}
+	if _, got := call(t, ts, "GET", "/bookings/"+b["id"].(string), ""); got["email"] != "ada.obi@example.com" {
+		t.Errorf("stored email not normalised: %v", got)
+	}
+}
